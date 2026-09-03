@@ -20,10 +20,8 @@ async def process_image(
     image: Annotated[UploadFile, File(description="JPEG, PNG, or WebP image")],
     image_uid: Annotated[str | None, Form()] = None,
 ) -> ImageEmbeddingResponse:
-    print(image)
-
     contents = await _read_upload(image, settings)
-    print(image)
+
     try:
         return await run_in_threadpool(processor.process, contents, image_uid)
     except ImageProcessingError as exception:
@@ -31,6 +29,37 @@ async def process_image(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=str(exception),
         ) from exception
+
+
+@router.post(
+    "/embed",
+    response_model=ImageEmbeddingResponse,
+    dependencies=[Depends(require_api_token)],
+)
+async def embed_faces(
+    image: Annotated[UploadFile, File(description="JPEG, PNG, or WebP search image")],
+) -> ImageEmbeddingResponse:
+    contents = await _read_upload(image, settings)
+
+    try:
+        result = await run_in_threadpool(
+            processor.process,
+            contents,
+            None,
+        )
+    except ImageProcessingError as exception:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exception),
+        ) from exception
+
+    if not result.faces:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="No frontal face was detected in the search image.",
+        )
+
+    return result
 
 
 async def _read_upload(upload: UploadFile, settings: Settings) -> bytes:
