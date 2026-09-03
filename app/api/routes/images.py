@@ -5,11 +5,10 @@ from fastapi.concurrency import run_in_threadpool
 
 from app.api.deps import processor, require_api_token
 from app.core.settings import Settings, settings
-from app.main import app
 from app.schemas.image_processor import ImageEmbeddingResponse
 from app.utils.open_cv_processor import ImageProcessingError
 
-router = APIRouter(prefix="images", tags=["images"])
+router = APIRouter(prefix="/images", tags=["images"])
 
 
 @router.post(
@@ -21,8 +20,10 @@ async def process_image(
     image: Annotated[UploadFile, File(description="JPEG, PNG, or WebP image")],
     image_uid: Annotated[str | None, Form()] = None,
 ) -> ImageEmbeddingResponse:
-    contents = await _read_upload(image, settings)
+    print(image)
 
+    contents = await _read_upload(image, settings)
+    print(image)
     try:
         return await run_in_threadpool(processor.process, contents, image_uid)
     except ImageProcessingError as exception:

@@ -6,7 +6,11 @@ from numpy.typing import NDArray
 from pydantic.dataclasses import dataclass
 
 from app.core.settings import Settings
-from app.schemas.image_processor import FaceEmbedding, ImageEmbeddingResponse
+from app.schemas.image_processor import (
+    BoundingBox,
+    FaceEmbedding,
+    ImageEmbeddingResponse,
+)
 
 
 class ImageProcessingError(ValueError):
