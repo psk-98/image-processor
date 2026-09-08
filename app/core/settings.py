@@ -24,6 +24,7 @@ class Settings(BaseSettings):
         "image/webp",
     )
     chunk_size: int = Field(default=1024 * 1024)
+    api_v1_str: str = "/api/v1"
 
 
 settings = Settings()

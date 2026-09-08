@@ -5,11 +5,10 @@ from fastapi.concurrency import run_in_threadpool
 
 from app.api.deps import processor, require_api_token
 from app.core.settings import Settings, settings
-from app.main import app
 from app.schemas.image_processor import ImageEmbeddingResponse
 from app.utils.open_cv_processor import ImageProcessingError
 
-router = APIRouter(prefix="images", tags=["images"])
+router = APIRouter(prefix="/images", tags=["images"])
 
 
 @router.post(
@@ -30,6 +29,37 @@ async def process_image(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=str(exception),
         ) from exception
+
+
+@router.post(
+    "/embed",
+    response_model=ImageEmbeddingResponse,
+    dependencies=[Depends(require_api_token)],
+)
+async def embed_faces(
+    image: Annotated[UploadFile, File(description="JPEG, PNG, or WebP search image")],
+) -> ImageEmbeddingResponse:
+    contents = await _read_upload(image, settings)
+
+    try:
+        result = await run_in_threadpool(
+            processor.process,
+            contents,
+            None,
+        )
+    except ImageProcessingError as exception:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exception),
+        ) from exception
+
+    if not result.faces:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="No frontal face was detected in the search image.",
+        )
+
+    return result
 
 
 async def _read_upload(upload: UploadFile, settings: Settings) -> bytes:

@@ -1,14 +1,8 @@
 from fastapi import FastAPI
 
+from app.api.main import api_router
 from app.core.settings import settings
 from app.schemas.health import HealthResponse
-
-
-class ImageProcessor(Protocol):
-    def process(
-        self, contents: bytes, image_uid: str | None = None
-    ) -> ImageEmbeddingResponse: ...
-
 
 app = FastAPI(
     title="FMI Image Processor",
@@ -24,3 +18,6 @@ def health() -> HealthResponse:
         model=settings.model,
         dimensions=settings.embedding_dimensions,
     )
+
+
+app.include_router(api_router, prefix=settings.api_v1_str)
