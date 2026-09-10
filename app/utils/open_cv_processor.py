@@ -1,9 +1,14 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from math import ceil, floor
+from pathlib import Path
+from threading import Lock
 from typing import Protocol
 
 import cv2
 import numpy as np
 from numpy.typing import NDArray
-from pydantic.dataclasses import dataclass
 
 from app.core.settings import Settings
 from app.schemas.image_processor import (
@@ -18,46 +23,69 @@ class ImageProcessingError(ValueError):
 
 
 class FaceDetector(Protocol):
-    def detectMultiScale3(
-        self, image: NDArray[np.uint8], **kwargs: object
-    ) -> tuple: ...
+    def setInputSize(self, input_size: tuple[int, int]) -> None: ...
+
+    def detect(
+        self, image: NDArray[np.uint8]
+    ) -> tuple[int, NDArray[np.float32] | None]: ...
+
+
+class FaceRecognizer(Protocol):
+    def alignCrop(
+        self,
+        image: NDArray[np.uint8],
+        face: NDArray[np.float32],
+    ) -> NDArray[np.uint8]: ...
+
+    def feature(self, aligned_face: NDArray[np.uint8]) -> NDArray[np.float32]: ...
 
 
 @dataclass(frozen=True, slots=True)
 class Detection:
+    face: NDArray[np.float32]
     x: int
     y: int
     width: int
     height: int
-    score: float | None
+    score: float
 
 
 class OpenCvFaceProcessor:
-    _HOG_SIZE = (64, 64)
+    """Detect faces with YuNet and create identity embeddings with SFace."""
+
+    EMBEDDING_DIMENSIONS = 128
 
     def __init__(
-        self, settings: Settings, detector: FaceDetector | None = None
+        self,
+        settings: Settings,
+        detector: FaceDetector | None = None,
+        recognizer: FaceRecognizer | None = None,
     ) -> None:
         self.settings = settings
         self.detector = detector or self._load_detector()
-        self.hog = cv2.HOGDescriptor(
-            self._HOG_SIZE,
-            (16, 16),
-            (8, 8),
-            (8, 8),
-            9,
-        )
+        self.recognizer = recognizer or self._load_recognizer()
+        self._inference_lock = Lock()
+
+        if settings.embedding_dimensions != self.EMBEDDING_DIMENSIONS:
+            raise RuntimeError(
+                "OpenCV SFace produces 128-dimensional embeddings; "
+                f"configured value is {settings.embedding_dimensions}."
+            )
 
     def process(
         self, contents: bytes, image_uid: str | None = None
     ) -> ImageEmbeddingResponse:
         image = self._decode(contents)
         height, width = image.shape[:2]
-        detections = self._detect_faces(image)
-        faces = [
-            self._face_embedding(image, detection, face_index)
-            for face_index, detection in enumerate(detections)
-        ]
+
+        # The models are shared by FastAPI's thread pool. Serialize access because
+        # OpenCV does not guarantee concurrent inference on one DNN model instance.
+        with self._inference_lock:
+            detections = self._detect_faces(image)
+            faces = [
+                self._face_embedding(image, detection, face_index)
+                for face_index, detection in enumerate(detections)
+            ]
 
         return ImageEmbeddingResponse(
             image_uid=image_uid,
@@ -69,20 +97,47 @@ class OpenCvFaceProcessor:
             faces=faces,
             embedding=faces[0].embedding if faces else None,
             metadata={
-                "face_detector": "opencv-haar-frontalface-default",
-                "descriptor": "opencv-hog-feature-hash",
+                "face_detector": "opencv-yunet-2023mar",
+                "descriptor": "opencv-sface-2021dec",
+                "embedding_normalization": "l2",
                 "face_limit_reached": len(detections) >= self.settings.max_faces,
             },
         )
 
     def _load_detector(self) -> FaceDetector:
-        cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        detector = cv2.CascadeClassifier(cascade_path)
+        model_path = self.settings.detector_model_path
+        self._require_model(model_path, "YuNet face detector")
 
-        if detector.empty():
-            raise RuntimeError(f"Unable to load OpenCV face cascade: {cascade_path}")
+        detector_factory = getattr(cv2, "FaceDetectorYN", None)
+        if detector_factory is None:
+            raise RuntimeError("This OpenCV build does not include FaceDetectorYN.")
 
-        return detector
+        return detector_factory.create(
+            str(model_path),
+            "",
+            (320, 320),
+            self.settings.detection_score_threshold,
+            self.settings.detection_nms_threshold,
+            self.settings.detection_top_k,
+        )
+
+    def _load_recognizer(self) -> FaceRecognizer:
+        model_path = self.settings.recognizer_model_path
+        self._require_model(model_path, "SFace recognizer")
+
+        recognizer_factory = getattr(cv2, "FaceRecognizerSF", None)
+        if recognizer_factory is None:
+            raise RuntimeError("This OpenCV build does not include FaceRecognizerSF.")
+
+        return recognizer_factory.create(str(model_path), "")
+
+    @staticmethod
+    def _require_model(model_path: Path, description: str) -> None:
+        if not model_path.is_file():
+            raise RuntimeError(
+                f"Missing {description} model at {model_path}. "
+                "Run `uv run python scripts/download_models.py`."
+            )
 
     def _decode(self, contents: bytes) -> NDArray[np.uint8]:
         if not contents:
@@ -104,27 +159,61 @@ class OpenCvFaceProcessor:
         return image
 
     def _detect_faces(self, image: NDArray[np.uint8]) -> list[Detection]:
-        grayscale = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        grayscale = cv2.equalizeHist(grayscale)
-        rectangles, _reject_levels, level_weights = self.detector.detectMultiScale3(
-            grayscale,
-            scaleFactor=1.1,
-            minNeighbors=5,
-            minSize=(self.settings.min_face_size, self.settings.min_face_size),
-            outputRejectLevels=True,
-        )
+        image_height, image_width = image.shape[:2]
+        longest_side = max(image_width, image_height)
+        scale = min(1.0, self.settings.detector_max_dimension / longest_side)
 
-        weights = np.asarray(level_weights).reshape(-1)
-        detections = [
-            Detection(
-                x=int(rectangle[0]),
-                y=int(rectangle[1]),
-                width=int(rectangle[2]),
-                height=int(rectangle[3]),
-                score=float(weights[index]) if index < len(weights) else None,
+        if scale < 1.0:
+            detector_width = max(1, round(image_width * scale))
+            detector_height = max(1, round(image_height * scale))
+            detector_image = cv2.resize(
+                image,
+                (detector_width, detector_height),
+                interpolation=cv2.INTER_AREA,
             )
-            for index, rectangle in enumerate(rectangles)
-        ]
+        else:
+            detector_image = image
+            detector_height, detector_width = image_height, image_width
+
+        self.detector.setInputSize((detector_width, detector_height))
+        _result, raw_faces = self.detector.detect(detector_image)
+
+        if raw_faces is None:
+            return []
+
+        detections: list[Detection] = []
+
+        for raw_face in raw_faces:
+            face = np.asarray(raw_face, dtype=np.float32).copy()
+
+            if face.size < 15 or not np.all(np.isfinite(face)):
+                continue
+
+            # YuNet returns x, y, width, height, five x/y landmarks, then score.
+            if scale < 1.0:
+                face[:14] /= scale
+
+            left = max(0, floor(float(face[0])))
+            top = max(0, floor(float(face[1])))
+            right = min(image_width, ceil(float(face[0] + face[2])))
+            bottom = min(image_height, ceil(float(face[1] + face[3])))
+            width = right - left
+            height = bottom - top
+
+            if width < self.settings.min_face_size or height < self.settings.min_face_size:
+                continue
+
+            detections.append(
+                Detection(
+                    face=face,
+                    x=left,
+                    y=top,
+                    width=width,
+                    height=height,
+                    score=float(face[-1]),
+                )
+            )
+
         largest = sorted(
             detections,
             key=lambda face: face.width * face.height,
@@ -139,16 +228,30 @@ class OpenCvFaceProcessor:
         detection: Detection,
         face_index: int,
     ) -> FaceEmbedding:
-        crop = self._crop_with_padding(image, detection)
-        grayscale = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        normalized = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(
-            grayscale
+        aligned_face = self.recognizer.alignCrop(image, detection.face)
+
+        if aligned_face is None or aligned_face.size == 0:
+            raise ImageProcessingError("SFace could not align the detected face.")
+
+        descriptor = (
+            self.recognizer.feature(aligned_face).reshape(-1).astype(np.float32)
         )
-        normalized = cv2.resize(
-            normalized, self._HOG_SIZE, interpolation=cv2.INTER_AREA
-        )
-        descriptor = self.hog.compute(normalized).reshape(-1).astype(np.float32)
-        embedding = self._feature_hash(descriptor)
+
+        if descriptor.size != self.settings.embedding_dimensions:
+            raise RuntimeError(
+                "Unexpected SFace embedding size: "
+                f"expected {self.settings.embedding_dimensions}, got {descriptor.size}."
+            )
+
+        if not np.all(np.isfinite(descriptor)):
+            raise ImageProcessingError("SFace returned an invalid face embedding.")
+
+        magnitude = float(np.linalg.norm(descriptor))
+
+        if not np.isfinite(magnitude) or magnitude <= np.finfo(np.float32).eps:
+            raise ImageProcessingError("SFace returned an empty face embedding.")
+
+        descriptor /= magnitude
 
         return FaceEmbedding(
             face_index=face_index,
@@ -159,80 +262,12 @@ class OpenCvFaceProcessor:
                 height=detection.height,
             ),
             detection_score=detection.score,
-            embedding=embedding.tolist(),
+            embedding=np.round(descriptor, decimals=8).tolist(),
             metadata={
-                "crop_padding_ratio": 0.15,
-                "descriptor_pixels": [self._HOG_SIZE[0], self._HOG_SIZE[1]],
+                "alignment": "sface-five-landmark",
+                "aligned_size": [
+                    int(aligned_face.shape[1]),
+                    int(aligned_face.shape[0]),
+                ],
             },
         )
-
-    def _face_embedding(
-        self,
-        image: NDArray[np.uint8],
-        detection: Detection,
-        face_index: int,
-    ) -> FaceEmbedding:
-        crop = self._crop_with_padding(image, detection)
-        grayscale = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        normalized = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(
-            grayscale
-        )
-        normalized = cv2.resize(
-            normalized, self._HOG_SIZE, interpolation=cv2.INTER_AREA
-        )
-        descriptor = self.hog.compute(normalized).reshape(-1).astype(np.float32)
-        embedding = self._feature_hash(descriptor)
-
-        return FaceEmbedding(
-            face_index=face_index,
-            bounding_box=BoundingBox(
-                x=detection.x,
-                y=detection.y,
-                width=detection.width,
-                height=detection.height,
-            ),
-            detection_score=detection.score,
-            embedding=embedding.tolist(),
-            metadata={
-                "crop_padding_ratio": 0.15,
-                "descriptor_pixels": [self._HOG_SIZE[0], self._HOG_SIZE[1]],
-            },
-        )
-
-    def _crop_with_padding(
-        self,
-        image: NDArray[np.uint8],
-        detection: Detection,
-    ) -> NDArray[np.uint8]:
-        image_height, image_width = image.shape[:2]
-        padding_x = round(detection.width * 0.15)
-        padding_y = round(detection.height * 0.15)
-        start_x = max(0, detection.x - padding_x)
-        start_y = max(0, detection.y - padding_y)
-        end_x = min(image_width, detection.x + detection.width + padding_x)
-        end_y = min(image_height, detection.y + detection.height + padding_y)
-
-        return image[start_y:end_y, start_x:end_x]
-
-    def _feature_hash(self, descriptor: NDArray[np.float32]) -> NDArray[np.float32]:
-        dimensions = self.settings.embedding_dimensions
-        feature_positions = np.arange(descriptor.size, dtype=np.uint64)
-        bucket_indices = (
-            feature_positions * np.uint64(2_654_435_761) + np.uint64(1_013_904_223)
-        ) % np.uint64(dimensions)
-        signs = np.where(
-            ((feature_positions * np.uint64(2_246_822_519)) >> np.uint64(16))
-            & np.uint64(1),
-            1.0,
-            -1.0,
-        ).astype(np.float32)
-        embedding = np.zeros(dimensions, dtype=np.float32)
-        np.add.at(embedding, bucket_indices.astype(np.intp), descriptor * signs)
-        magnitude = float(np.linalg.norm(embedding))
-
-        if magnitude <= np.finfo(np.float32).eps:
-            embedding[0] = 1.0
-        else:
-            embedding /= magnitude
-
-        return np.round(embedding, decimals=8)

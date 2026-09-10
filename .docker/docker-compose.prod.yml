@@ -2,8 +2,8 @@ services:
   app:
     container_name: image-processor-app
     build:
-      context: .
-      dockerfile: ./.docker/app/Dockerfile
+      context: ..
+      dockerfile: .docker/app/Dockerfile
     ports:
       - "127.0.0.1:8001:8000"
     restart: unless-stopped
