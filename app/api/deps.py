@@ -16,14 +16,12 @@ def require_api_token(
     authorization: Annotated[str | None, Header()] = None,
 ) -> None:
     expected_token = settings.api_token
-    print(expected_token)
     if expected_token is None:
         return
 
     expected_token_value = expected_token.get_secret_value()
 
     scheme, separator, provided_token = (authorization or "").partition(" ")
-    print(provided_token)
     authenticated = (
         separator == " "
         and scheme.lower() == "bearer"

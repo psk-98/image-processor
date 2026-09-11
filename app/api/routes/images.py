@@ -56,7 +56,7 @@ async def embed_faces(
     if not result.faces:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="No frontal face was detected in the search image.",
+            detail="No face was detected in the search image.",
         )
 
     return result

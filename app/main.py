@@ -7,7 +7,7 @@ from app.schemas.health import HealthResponse
 app = FastAPI(
     title="FMI Image Processor",
     version="0.1.0",
-    description="Detects every frontal face and returns one pgvector-ready embedding per face.",
+    description="Detects faces and returns one pgvector-ready identity embedding per face.",
 )
 
 
